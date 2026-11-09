@@ -1,4 +1,4 @@
-# Pi extensions
+# me-like-pi
 
 Extensions and a skill for the [Pi coding agent](https://github.com/earendil-works/pi),
 taken from my own setup and cleaned up to share. They're written for Pi 1.5 and Node 22,
@@ -36,7 +36,7 @@ As a Pi package, loading only what you want (recommended):
 {
   "packages": [
     {
-      "source": "git:github.com/kylegrover/pi-extensions",
+      "source": "git:github.com/kylegrover/me-like-pi",
       "extensions": [
         "extensions/pi-warm-compact.ts",
         "extensions/pi-delegate.ts",
@@ -54,7 +54,7 @@ Put that in `~/.pi/agent/settings.json` (merge with your existing `packages`), t
 everything with:
 
 ```sh
-pi install git:github.com/kylegrover/pi-extensions
+pi install git:github.com/kylegrover/me-like-pi
 ```
 
 To try one extension without installing: `pi -e ./extensions/pi-grab.ts`.
