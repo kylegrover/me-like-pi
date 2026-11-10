@@ -10,7 +10,7 @@
  *     into a note, or regex-replace inside a message.
  * Raw history is never changed; edits only affect future model context.
  */
-import { estimateMessageTokens } from "./warm-compact.ts";
+import { estimateMessageTokens, estimateProjected } from "./warm-compact.ts";
 
 export const RESULT_KEEP = 300;   // chars of a tool result kept in its placeholder
 export const ARGS_KEEP = 200;     // chars of tool-call arguments kept
@@ -26,6 +26,7 @@ export type Op =
   | { op: "condense"; n: number; text: string }
   | { op: "fold"; from: number; to: number; note: string }
   | { op: "replace"; n: number; find: string; with: string }
+  | { op: "merge"; text: string }
   | { op: "keep"; n: number };
 
 const textOf = (content: any): string =>
@@ -122,6 +123,7 @@ export function parsePlan(reply: string): { ops?: Op[]; invalid?: string[]; erro
     else if (o?.op === "fold" && Number.isInteger(o.from) && Number.isInteger(o.to) && o.to >= o.from && typeof o.note === "string") ops.push({ op: "fold", from: o.from, to: o.to, note: o.note });
     else if (o?.op === "replace" && Number.isInteger(o.n) && typeof o.find === "string" && typeof o.with === "string") ops.push({ op: "replace", n: o.n, find: o.find, with: o.with });
     else if (o?.op === "keep" && Number.isInteger(o.n)) ops.push({ op: "keep", n: o.n });
+    else if (o?.op === "merge" && typeof o.text === "string" && o.text.trim()) ops.push({ op: "merge", text: o.text.trim() });
     else invalid.push(`malformed op: ${JSON.stringify(o).slice(0, 120)}`);
   }
   return { ops, invalid };
@@ -200,7 +202,7 @@ export function applyPlan(projected: Projected[], start: number, cut: number, it
   }
 
   for (const op of ops) {
-    if (op.op === "fold" || op.op === "keep") continue;
+    if (op.op === "fold" || op.op === "keep" || op.op === "merge") continue;
     const it = byN.get(op.n);
     if (!it) { skipped.push(`${op.op} #${op.n}: unknown message`); continue; }
     if (folded.has(it.index)) { skipped.push(`${op.op} #${op.n}: inside a fold`); continue; }
@@ -272,13 +274,115 @@ export function mapTokens(items: MapItem[]): number {
   return items.reduce((s, it) => s + it.tokens, 0);
 }
 
-export function editRequest(boundaryHint: string, items: MapItem[], rulesSaved: number, focus?: string): string {
-  // The size target counts only messages not compacted before: earlier passes already did theirs.
-  const fresh = items.filter(it => !it.compacted);
+/**
+ * Second tier (rolling compaction): when the part earlier passes compacted is over its budget, the
+ * oldest stretch of it (and any earlier summary at the top) is replaced by one note, written as a
+ * Pi compaction entry whose kept range starts at a user message. Later edits stay in force.
+ */
+export type MergePlan = {
+  /** Index in the projection of the first entry kept (a user message). */
+  keepIndex: number; firstKeptEntryId: string;
+  /** Map numbers of the merged messages. */
+  fromN: number; toN: number;
+  /** Estimated tokens: the merged stretch, the whole compacted part, and the note to aim for. */
+  tokens: number; compactedTokens: number; noteTokens: number;
+  /** An earlier summary (Pi's /compact, or a previous merge) is at the top and goes into the note too. */
+  hasSummary: boolean;
+  /** the user's messages in the stretch, listed under the note with their recall IDs. */
+  users: { id: string; opening: string }[];
+};
+
+/** The compacted part ends after the last message an earlier pass shortened. */
+export function compactedEnd(items: MapItem[], cut: number): number {
+  const last = [...items].reverse().find(it => it.compacted);
+  if (!last) return -1;
+  const next = items.find(it => it.index > last.index);
+  return next ? next.index : cut;
+}
+
+export function planMerge(projected: Projected[], items: MapItem[], cut: number, budgetEst: number): MergePlan | undefined {
+  if (!(budgetEst > 0)) return undefined;
+  const end = compactedEnd(items, cut);
+  if (end <= 0) return undefined;
+  const compactedTokens = estimateProjected(projected, 0, end);
+  if (compactedTokens <= budgetEst) return undefined;
+  // Merge from the top until about half the budget is left, so the next passes don't merge again at once.
+  const goal = compactedTokens - budgetEst / 2;
+  let acc = 0, i = 0;
+  for (; i < end && acc < goal; i++) acc += estimateProjected(projected, i, i + 1);
+  const isUser = (p: Projected) => p.sourceEntry.type === "message" && only(p)?.role === "user";
+  let keep = -1;
+  for (let j = Math.max(i, 1); j < cut; j++) if (isUser(projected[j]!)) { keep = j; break; }
+  if (keep < 0) return undefined;
+  const merged = items.filter(it => it.index < keep);
+  if (merged.length === 0) return undefined;
+  const tokens = estimateProjected(projected, 0, keep);
+  return { keepIndex: keep, firstKeptEntryId: projected[keep]!.sourceEntry.id, fromN: merged[0]!.n, toN: merged[merged.length - 1]!.n,
+    tokens, compactedTokens, noteTokens: Math.max(1500, Math.min(8000, Math.round(tokens * 0.12))),
+    hasSummary: projected[0]?.sourceEntry.type === "compaction",
+    // Only plain user messages: context_recall reads message entries (not custom ones).
+    users: merged.filter(it => it.role === "user" && projected[it.index]!.sourceEntry.type === "message")
+      .map(it => ({ id: it.entryId, opening: it.opening.slice(0, 70) })) };
+}
+
+/** How many of the user's merged messages the note lists (newest first kept); the rest are counted. */
+export const USER_INDEX_MAX = 40;
+
+/**
+ * The compaction summary for a merge: the model's note plus a recall index of the user's messages,
+ * carrying over the index of an earlier merge (`carried`, oldest first) up to USER_INDEX_MAX.
+ */
+export function mergeSummary(note: string, merge: MergePlan, carried: { id: string; opening: string }[] = [], carriedOlder = 0):
+  { summary: string; users: { id: string; opening: string }[]; older: number } {
+  const all = [...carried, ...merge.users];
+  const users = all.slice(-USER_INDEX_MAX);
+  const older = carriedOlder + all.length - users.length;
+  const index = users.map(u => `- ${u.id}: ${JSON.stringify(u.opening)}`).join("\n");
+  const more = older ? `\n(${older} older ones are not listed; they are in the session file.)` : "";
+  const summary = `[warm-compact: the oldest part of this session, merged into one note. Every original is still in the session file.]\n\n${note}${index ? `\n\nThe user's messages from that part (context_recall("<id>") returns the full text):\n${index}${more}` : ""}`;
+  return { summary, users, older };
+}
+
+/**
+ * Take the merge note out of the plan. With a note, ops on merged messages are dropped (with a
+ * reason); without one (or when no merge was asked for) the merge doesn't happen and all other ops stay.
+ */
+export function splitMergeOps(ops: Op[], items: MapItem[], merge: MergePlan | undefined): { ops: Op[]; note?: string; skipped: string[] } {
+  const note = (ops.filter(o => o.op === "merge") as Extract<Op, { op: "merge" }>[]).map(o => o.text).join("\n\n") || undefined;
+  const rest = ops.filter(o => o.op !== "merge");
+  if (!merge) return { ops: rest, skipped: note ? ["merge: no merge was asked for"] : [] };
+  if (!note) return { ops: rest, skipped: ["merge: the plan had no merge note, so the oldest stretch stays"] };
+  const merged = new Set(items.filter(it => it.index < merge.keepIndex).map(it => it.n));
+  const skipped: string[] = [];
+  const kept: Op[] = [];
+  for (const o of rest) {
+    const hit = o.op === "fold" ? merged.has(o.from) || merged.has(o.to) : o.op !== "keep" && merged.has(o.n);
+    if (hit) skipped.push(`${o.op} #${o.op === "fold" ? `${o.from}-#${o.to}` : (o as { n: number }).n}: inside the merged stretch`);
+    else kept.push(o);
+  }
+  return { ops: kept, note, skipped };
+}
+
+export type RequestOptions = { focus?: string; target?: number | "auto"; merge?: MergePlan; scale?: number };
+
+export function editRequest(boundaryHint: string, items: MapItem[], rulesSaved: number, focusOrOptions?: string | RequestOptions): string {
+  const o: RequestOptions = typeof focusOrOptions === "string" ? { focus: focusOrOptions } : focusOrOptions ?? {};
+  const focus = o.focus;
+  const scale = o.scale ?? 1;
+  // The size target counts only new text: not what earlier passes compacted, not the merged stretch,
+  // and not the user's messages inside the compacted part (they stay verbatim either way).
+  const end = compactedEnd(items, Infinity);
+  const fresh = items.filter(it => !it.compacted && it.index >= (o.merge?.keepIndex ?? 0) && !(it.role === "user" && it.index < end));
   const text = mapTokens(fresh);
-  const keep = Math.max(1, Math.round((text * 0.4) / 1000));
-  const earlier = items.length - fresh.length;
+  const pct = o.target === "auto" ? undefined : o.target ?? 0.4;
+  const keep = Math.max(1, Math.round((text * (pct ?? 0.4)) / 1000));
+  const earlier = items.filter(it => it.compacted && it.index >= (o.merge?.keepIndex ?? 0)).length;
   const again = earlier ? `\n\n${earlier} messages are marked (compacted): an earlier pass already shortened them, and the cache is warm up to them. Leave them as they are unless something later made them obsolete; every change there makes the next turn rewrite the cache from that point.` : "";
+  const k = (n: number) => `${Math.round((n * scale) / 1000)}k`;
+  const merge = o.merge ? `\n\nMerge: the part earlier passes compacted is now ~${k(o.merge.compactedTokens)} tokens, over its budget. Messages #${o.merge.fromN} to #${o.merge.toN} (~${k(o.merge.tokens)}, the oldest)${o.merge.hasSummary ? ", together with the earlier summary at the top of the context," : ""} will be replaced by one note. Add {"op":"merge","text":"..."} with that note: what from that stretch still matters for the work ahead (goals, constraints and preferences, decisions with their reasons, open items, exact paths, IDs, commands and numbers still in use). Leave out finished work nothing later depends on. Aim for about ${k(o.merge.noteTokens)} tokens. the user's messages from that stretch are listed under the note with recall IDs automatically. Don't use other ops on #${o.merge.fromN} to #${o.merge.toN}.` : "";
+  const sizeLine = pct === undefined
+    ? `Size target: the mapped conversation text${earlier ? " not yet compacted" : ""} is about ${Math.round(text / 1000)}k tokens. You choose how much to keep, between ~${Math.max(1, Math.round(text * 0.25 / 1000))}k and ~${Math.max(1, Math.round(text * 0.6 / 1000))}k (25-60%): keep more where the detail will likely matter again (open work, numbers, decisions), less for finished side-quests.`
+    : `Size target: the mapped conversation text${earlier ? " not yet compacted" : ""} is about ${Math.round(text / 1000)}k tokens. Leave at least ~${keep}k of it (about ${Math.round(pct * 100)}%). Compacting further loses detail that's cheap to keep.`;
   return `[pi-warm-compact request]
 This is a context-compaction step, not a task. Do not call any tools. Reply with exactly one \`\`\`json block and nothing else.
 
@@ -290,7 +394,7 @@ Return {"edits": [...]} using:
 - {"op":"replace","n":5,"find":"<regex>","with":"..."}: targeted edit inside #5.
 Messages you don't mention stay as they are. Prefer condense over fold. Don't remove anything still needed verbatim.
 
-Size target: the mapped conversation text${earlier ? " not yet compacted" : ""} is about ${Math.round(text / 1000)}k tokens. Leave at least ~${keep}k of it (about 40%). Compacting further loses detail that's cheap to keep.${again}${focus ? `\n\nAdditional focus: ${focus}` : ""}
+${sizeLine}${again}${merge}${focus ? `\n\nAdditional focus: ${focus}` : ""}
 
 Map:
 ${mapText(items)}`;

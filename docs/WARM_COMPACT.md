@@ -20,7 +20,7 @@ cache. The model also sees full tool results, not 2,000-character cuts.
 
 Two modes:
 
-- **`/warm-compact [focus]` (edit mode, the default).** Nothing is summarized away:
+- **`/warm-compact [options] [focus]` (edit mode, the default).** Recent history is never summarized:
   1. **Rules, no model:** old tool results over 400 characters become their first 300
      characters plus a `context_recall("<id>")` note; long tool-call arguments shrink the same
      way; thinking is dropped from old replies.
@@ -30,12 +30,27 @@ Two modes:
   - Everything is applied as Pi `context_edit` entries. The session file keeps every
     original, and the `context_recall` tool returns any of them, so the model can look up
     exact output it compacted away.
-  - Your own messages are never removed. The last ~20k tokens stay verbatim.
+  - Your own messages are never removed. The last ~30k tokens stay verbatim.
   - A second pass later leaves the first pass's edits alone and works on the newer text.
+  - **Rolling:** once the part earlier passes compacted is over its budget (40k by
+    default), its oldest stretch, together with any earlier summary at the top, is merged
+    into one note. That is written as a Pi compaction entry, followed by an index of your
+    messages from that stretch with their `context_recall` IDs. So repeated runs keep the
+    context bounded: detail fades with age instead of all at once.
 - **`/warm-compact summary [focus]`.** The model writes a structured checkpoint (goal,
   constraints, progress, decisions, next steps, critical context) and Pi's normal
-  compaction entry replaces the old turns with it. The last ~20k tokens stay verbatim. Use
+  compaction entry replaces the old turns with it. The last ~30k tokens stay verbatim. Use
   it as the fallback if edit mode is refused (below).
+
+Options go before the focus text, all optional:
+
+| Option | Default | Meaning |
+|---|---|---|
+| `keep=30k` | 30k | Tokens kept verbatim at the end. |
+| `target=40%` | 40% | How much of the new conversation text to keep (edit mode). `target=auto` lets the model choose between 25% and 60%. |
+| `budget=40k` | 40k | Cap on the part earlier passes compacted before its oldest stretch is merged. `budget=off` never merges. |
+
+For example: `/warm-compact keep=50k target=auto keep the benchmark numbers`.
 
 During the compaction turn tool calls are blocked (the tools stay declared so the cached
 prefix still matches). Afterwards the instruction and the model's reply are hidden from the
@@ -83,12 +98,14 @@ kept.
   With the Claude Code adapter, a changed tool definition used to force a full rewrite;
   [kylegrover/pi-claude-code](https://github.com/kylegrover/pi-claude-code) fixes that.
 - **Size estimates** in the status line come from character counts scaled by the last
-  reply's real token usage. They can be off by ~20k; the next turn's usage is the real
-  number.
+  reply's real token usage, leaving out thinking (Claude drops old thinking) and a fixed
+  ~15k for the system prompt and tools. On five measured runs that was within ~4%; the
+  next turn's usage is the real number.
+- **The turn after a merge** rewrites the cache from the top, as after any compaction.
 
 ## Ideas not built yet
 
 - An extra cache breakpoint at the previous compaction boundary, so the turn after a second
   pass reads up to it instead of rewriting everything.
 - A rules-only mode (no model call at all).
-- Occasionally summarizing the oldest already-compacted stretch, if repeated passes grow.
+- Letting the working agent start a compaction itself (a tool), choosing the options.

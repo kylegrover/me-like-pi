@@ -4,7 +4,7 @@ import { Type } from "typebox";
 import * as sdk from "@earendil-works/pi-coding-agent";
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import { matchesKey, Box, Text } from "@earendil-works/pi-tui";
-import { defaultContinueTask, runDelegate, workerInstructions, type InvokedBy, type ParentSnapshot, type Progress } from "./lib/delegation-run.ts";
+import { defaultContinueTask, runWithSelfCheck, workerInstructions, type InvokedBy, type ParentSnapshot, type Progress } from "./lib/delegation-run.ts";
 import { progressLines, summaryLine } from "./lib/delegation-view.ts";
 import { createDelegateAudit } from "./lib/delegation-audit.ts";
 import { thinkingLevels } from "./lib/worker-model.ts";
@@ -125,10 +125,11 @@ export default function (pi: sdk.ExtensionAPI) {
       streamSimple: registry.streamSimple.bind(registry),
     } as unknown as sdk.ModelRuntime;
     try {
-      const result = await runDelegate(sdk, { snapshot: captured, task, thinkingLevel, cwd: ctx.cwd, invokedBy, onProgress, continueFrom,
-        evidenceDir: join(sdk.getAgentDir(), "delegates"), modelRuntime: runtime, signal: controller.signal,
-        origin: { parentRequestId, parentToolCallId: toolCallId, guidanceId: audit.guidanceId, invokedBy } });
-      record({ kind: "outcome", status: result.details.status, elapsedMs: Math.round(performance.now() - started),
+      const result = await runWithSelfCheck(sdk, { snapshot: captured, task, thinkingLevel, cwd: ctx.cwd,
+        invokedBy, onProgress, continueFrom, evidenceDir: join(sdk.getAgentDir(), "delegates"), modelRuntime: runtime,
+        signal: controller.signal, origin: { parentRequestId, parentToolCallId: toolCallId, guidanceId: audit.guidanceId, invokedBy } });
+      record({ kind: "outcome", status: result.details.status, autoContinued: result.details.autoContinued,
+        elapsedMs: Math.round(performance.now() - started),
         workerSessionId: result.details.sessionId, workerSessionFile: result.details.sessionFile,
         usage: result.usage, workerThinkingLevel: result.details.thinkingLevel, toolErrors: result.details.toolErrors,
         receiptCharacters: result.content[0].text.length });

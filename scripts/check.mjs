@@ -74,7 +74,8 @@ if (!only || only === 'types') {
 
 if (!only || only === 'links') {
   // Relative Markdown links in tracked docs must resolve (http/mailto/anchors-only skipped).
-  const tracked = run('git', ['ls-files', '*.md']).stdout.split('\n').filter(Boolean);
+  // share/public/ is laid out for the public repo, so its links are checked there instead.
+  const tracked = run('git', ['ls-files', '*.md']).stdout.split('\n').filter(f => f && !f.startsWith('share/public/'));
   const broken = [];
   for (const file of tracked) {
     const text = readFileSync(join(repo, file), 'utf8');

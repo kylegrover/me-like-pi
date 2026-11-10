@@ -52,7 +52,19 @@ export interface WarmPlan {
   keptTokens: number;
 }
 
-/** Rough token estimate in Pi's style (chars / 4). */
+/**
+ * Real tokens the estimate doesn't see: system prompt, tool definitions and harness framing.
+ * With PER_MESSAGE and thinking left out, this fit five measured runs within ~4% (11-09; before,
+ * the estimate was 9-17% low). Only used to turn estimates into real tokens.
+ */
+export const CONTEXT_OVERHEAD = 15_000;
+/** Framing per message (role, ids, tool-call wrappers). */
+export const PER_MESSAGE = 20;
+
+/**
+ * Rough token estimate (chars / 4, plus framing). Thinking is left out: Claude drops the thinking of
+ * earlier turns from the context, so it costs (almost) nothing there.
+ */
 export function estimateMessageTokens(m: any): number {
   const c = m?.content;
   let chars = 0;
@@ -60,13 +72,68 @@ export function estimateMessageTokens(m: any): number {
   else if (Array.isArray(c)) {
     for (const b of c) {
       if (b?.type === "text") chars += b.text?.length ?? 0;
-      else if (b?.type === "thinking") chars += b.thinking?.length ?? 0;
       else if (b?.type === "toolCall") chars += JSON.stringify(b.arguments ?? {}).length + (b.name?.length ?? 0);
       else if (b?.type === "image") chars += 4800;
     }
   }
   if (m?.role === "compactionSummary" || m?.role === "branchSummary") chars += (m.summary?.length ?? 0);
-  return Math.ceil(chars / 4);
+  return Math.ceil(chars / 4) + PER_MESSAGE;
+}
+
+/** Estimated tokens of all projected entries. */
+export function estimateProjected(projected: Projected[], from = 0, to = projected.length): number {
+  let t = 0;
+  for (let i = from; i < to; i++) for (const m of projected[i]!.messages) t += estimateMessageTokens(m);
+  return t;
+}
+
+/** Factor from estimated to real tokens, given the real context size from the provider. */
+export function realScale(realTokens: number | undefined, estimatedTotal: number): number {
+  if (!realTokens || estimatedTotal <= 0 || realTokens <= CONTEXT_OVERHEAD) return 1;
+  return (realTokens - CONTEXT_OVERHEAD) / estimatedTotal;
+}
+
+export type WarmOptions = {
+  mode: "edit" | "summary";
+  /** Real tokens kept verbatim at the end. */
+  keep: number;
+  /** Fraction of the new conversation text to keep (edit mode; default 0.4); "auto" lets the model choose in 25-60%. */
+  target?: number | "auto";
+  /** Real-token budget for the part earlier passes compacted; over it, the oldest stretch is merged. 0 = off. */
+  budget: number;
+  focus?: string;
+  errors: string[];
+};
+export const DEFAULT_KEEP = 30_000;
+export const DEFAULT_BUDGET = 40_000;
+
+/** `/warm-compact [edit|summary] [keep=30k] [target=40%|auto] [budget=40k|off] [focus…]` */
+export function parseWarmArgs(args: string): WarmOptions {
+  const o: WarmOptions = { mode: "edit", keep: DEFAULT_KEEP, budget: DEFAULT_BUDGET, errors: [] };
+  const words = args.trim().split(/\s+/).filter(Boolean);
+  let i = 0;
+  const tokens = (v: string) => { const m = /^(\d+(?:\.\d+)?)(k?)$/i.exec(v); return m ? Math.round(Number(m[1]) * (m[2] ? 1000 : 1)) : NaN; };
+  for (; i < words.length; i++) {
+    const w = words[i]!;
+    if (i === 0 && /^(edit|summary)$/i.test(w)) { o.mode = w.toLowerCase() as WarmOptions["mode"]; continue; }
+    const kv = /^(keep|target|budget)=(.+)$/i.exec(w);
+    if (!kv) break;
+    const key = kv[1]!.toLowerCase(), v = kv[2]!;
+    if (key === "keep") {
+      const n = tokens(v);
+      if (n >= 2_000 && n <= 500_000) o.keep = n; else o.errors.push(`keep=${v}: use a token count like 30k (2k-500k)`);
+    } else if (key === "target") {
+      const m = /^(\d+(?:\.\d+)?)%?$/.exec(v); const n = m ? Number(m[1]) : NaN;
+      if (/^auto$/i.test(v)) o.target = "auto";
+      else if (n >= 5 && n <= 95) o.target = n / 100; else o.errors.push(`target=${v}: use a percentage like 40% (5-95), or auto`);
+    } else {
+      if (/^(off|0)$/i.test(v)) o.budget = 0;
+      else { const n = tokens(v); if (n >= 5_000) o.budget = n; else o.errors.push(`budget=${v}: use a token count like 40k (5k or more), or off`); }
+    }
+  }
+  const focus = words.slice(i).join(" ").trim();
+  if (focus) o.focus = focus;
+  return o;
 }
 
 function isCutPoint(p: Projected): boolean {

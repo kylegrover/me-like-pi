@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import * as fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import { runDelegate, sharedPayload, workerInstructions } from '../extensions/lib/delegation-run.ts';
+import { runDelegate, runWithSelfCheck, sharedPayload, workerInstructions, STOPPED_MARKER, autoCheckTask } from '../extensions/lib/delegation-run.ts';
 import { workerThinking } from '../extensions/lib/worker-model.ts';
 import { loadDelegationNative } from './helpers/delegation-native.mjs';
 import { syntheticAssistant, syntheticTranscript } from '../scripts/lib/delegation-context-spike.mjs';
@@ -749,3 +749,73 @@ async function runDelegateWith(f, opts) {
   return runDelegate(f.sdk, { snapshot: f.snapshot, cwd: f.cwd, task: 'x', evidenceDir: path.join(f.dir, 'evidence'),
     modelRuntime: f.runtime, ...opts });
 }
+
+// One automatic self-check after a new worker's first budget hit (runWithSelfCheck).
+async function selfCheckSetup(t, replies) {
+  const model = await claudeModel();
+  const f = await setup(t, replies, { model });
+  const run = opts => runWithSelfCheck(f.sdk, { snapshot: f.snapshot, cwd: f.cwd,
+    task: 'Update the old decision in notes.md to agreed decision.',
+    evidenceDir: path.join(f.dir, 'evidence'), modelRuntime: f.runtime, ...opts });
+  return { f, run };
+}
+
+test('self-check: past halfway after the first budget, it continues once and completes', { skip: !root }, async t => {
+  const { f, run } = await selfCheckSetup(t, [
+    call('write', { path: 'a.txt', content: '1' }, 1),
+    call('write', { path: 'b.txt', content: '2' }, 2),
+    call('write', { path: 'c.txt', content: '3' }, 3),
+    [{ type: 'text', text: 'Past halfway; finished c. All done.' }],
+  ]);
+  const result = await run({ maxTurns: 2 });
+  assert.equal(result.isError, false, result.content[0].text);
+  assert.equal(result.details.autoContinued, true);
+  assert.equal(result.details.firstBudgetHit, 'requests');
+  assert.equal(result.details.continuation, 1);
+  assert.match(result.content[0].text, /^\[Worker ran out of its first budget \(requests\), checked its progress, and judged itself past halfway/);
+  assert.match(result.content[0].text, /All done/);
+  const prompts = f.requests.map(r => JSON.stringify(r.context.messages.at(-1)));
+  assert.ok(prompts.some(p => p.includes('judge honestly how far along')), 'the check prompt was sent');
+  assert.equal(result.details.requests, f.requests.length, 'requests of both runs are summed');
+});
+
+test('self-check: halfway or less, the worker stops and the result says so', { skip: !root }, async t => {
+  const { run } = await selfCheckSetup(t, [
+    call('write', { path: 'a.txt', content: '1' }, 1),
+    call('write', { path: 'b.txt', content: '2' }, 2),
+    call('write', { path: 'c.txt', content: '3' }, 3),
+    [{ type: 'text', text: `${STOPPED_MARKER}\nDone: a, b. Remaining: c through j. No checks run.` }],
+  ]);
+  const result = await run({ maxTurns: 2 });
+  assert.equal(result.isError, true);
+  assert.equal(result.details.autoContinued, true);
+  assert.match(result.content[0].text, /checked its progress, and judged itself halfway done or less, and stopped/);
+  assert.match(result.content[0].text, /Remaining: c through j/);
+  assert.match(result.content[0].text, /Continue with: delegate\(\{ continue:/, 'the parent can still continue it');
+});
+
+test('self-check: a second budget hit reports back without another automatic continuation', { skip: !root }, async t => {
+  const { f, run } = await selfCheckSetup(t, Array.from({ length: 8 }, (_, i) => call('write', { path: `f${i}.txt`, content: 'x' }, i)));
+  const result = await run({ maxTurns: 2 });
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /continued once automatically and stopped again/);
+  assert.match(result.content[0].text, /Continue with: delegate\(\{ continue:/);
+  assert.equal(f.requests.filter(r => JSON.stringify(r.context.messages.at(-1)).includes('judge honestly how far along')).length, 1,
+    'only one automatic check');
+  // An explicit continuation never gets an automatic one.
+  const again = await run({ maxTurns: 2, continueFrom: result.details.sessionFile, task: 'keep going' });
+  assert.equal(again.details.autoContinued, false);
+  assert.equal(again.details.continuation, 2);
+});
+
+test('self-check: a cancelled or failed worker is not continued automatically', { skip: !root }, async t => {
+  const controller = new AbortController();
+  const model = await claudeModel();
+  const f = await setup(t, [], { model, beforeReply: () => controller.abort() });
+  const result = await runWithSelfCheck(f.sdk, { snapshot: f.snapshot, cwd: f.cwd, task: 'x',
+    evidenceDir: path.join(f.dir, 'evidence'), modelRuntime: f.runtime, signal: controller.signal });
+  assert.equal(result.details.autoContinued, false);
+  assert.match(result.content[0].text, /Cancelled/);
+  assert.equal(f.requests.length, 1);
+  assert.match(autoCheckTask, new RegExp(STOPPED_MARKER));
+});

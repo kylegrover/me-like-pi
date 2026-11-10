@@ -129,7 +129,7 @@ test('native: /warm-compact edit applies rule + model edits; context_recall rest
   await session.prompt('Look at the log.');
   await session.prompt('Analyse it.');
   await session.prompt('Now the recent part.');
-  await session.prompt('/warm-compact edit');
+  await session.prompt('/warm-compact edit keep=20k');
   for (let i = 0; i < 50 && requests.length < 5; i++) await new Promise(r => setTimeout(r, 10));
   await session.waitForIdle();
   const status = manager.getBranch().filter(e => e.type === 'custom' && e.customType === 'pi-warm-compact-status').map(e => e.data);
@@ -249,4 +249,162 @@ test('second pass: earlier placeholders are not re-stubbed, compacted messages a
   const r = editRequest('the user message', items, 0);
   assert.match(r, /not yet compacted is about 4k tokens/, 'target from new text only');
   assert.match(r, /1 messages are marked \(compacted\)/);
+});
+
+test('options: keep, target (percent or auto), budget (tokens or off), then focus; bad values are reported', async () => {
+  const { parseWarmArgs, DEFAULT_KEEP, DEFAULT_BUDGET } = await import('../extensions/lib/warm-compact.ts');
+  const d = parseWarmArgs('');
+  assert.deepEqual([d.mode, d.keep, d.budget, d.target, d.focus, d.errors], ['edit', DEFAULT_KEEP, DEFAULT_BUDGET, undefined, undefined, []]);
+  const o = parseWarmArgs('summary keep=50k target=55% budget=off keep the G1 numbers');
+  assert.deepEqual([o.mode, o.keep, o.target, o.budget, o.focus], ['summary', 50_000, 0.55, 0, 'keep the G1 numbers']);
+  assert.equal(parseWarmArgs('target=auto').target, 'auto');
+  assert.equal(parseWarmArgs('budget=60k').budget, 60_000);
+  assert.equal(parseWarmArgs('the keep=10k part is focus').focus, 'the keep=10k part is focus', 'options only at the start');
+  assert.deepEqual(parseWarmArgs('keep=1k target=200 budget=2k').errors.length, 3);
+});
+
+test('estimate: thinking is not counted; real scale leaves out the fixed overhead', async () => {
+  const { estimateMessageTokens, realScale, PER_MESSAGE, CONTEXT_OVERHEAD } = await import('../extensions/lib/warm-compact.ts');
+  const m = { role: 'assistant', content: [{ type: 'thinking', thinking: 'x'.repeat(4000) }, { type: 'text', text: 'y'.repeat(400) }] };
+  assert.equal(estimateMessageTokens(m), 100 + PER_MESSAGE);
+  assert.equal(realScale(CONTEXT_OVERHEAD + 200_000, 100_000), 2);
+  assert.equal(realScale(undefined, 100), 1);
+});
+
+// A long session after earlier passes: an old summary on top, compacted turns, then new turns.
+const rolling = () => {
+  const raw = (id, role, text) => ({ id, type: 'message', message: { role, content: role === 'user' ? text : [{ type: 'text', text }] } });
+  const compacted = (id, text, shown) => ({ sourceEntry: raw(id, 'assistant', text), messages: [{ role: 'assistant', content: [{ type: 'text', text: shown }] }] });
+  const plain = (id, role, text) => ({ sourceEntry: raw(id, role, text), messages: [{ role, content: role === 'user' ? text : [{ type: 'text', text }] }] });
+  const out = [{ sourceEntry: { id: 'c0', type: 'compaction', summary: 'S'.repeat(20_000) }, messages: [{ role: 'compactionSummary', summary: 'S'.repeat(20_000), content: '' }] }];
+  for (let i = 1; i <= 12; i++) {
+    out.push(plain(`u${i}`, 'user', `old request ${i}`));
+    out.push(compacted(`a${i}`, 'long '.repeat(4000), `condensed answer ${i}: ` + 'c'.repeat(8000)));
+  }
+  for (let i = 13; i <= 16; i++) { out.push(plain(`u${i}`, 'user', `new request ${i}`)); out.push(plain(`a${i}`, 'assistant', 'fresh '.repeat(3000))); }
+  return out;
+};
+
+test('rolling: no merge under budget; over it, the oldest compacted stretch (and the old summary) merge, cut at a user message', async () => {
+  const { planMerge, compactedEnd } = await import('../extensions/lib/edit-compact.ts');
+  const projected = rolling();
+  const cut = projected.length - 2;
+  const items = buildMap(projected, 1, cut);
+  assert.equal(projected[compactedEnd(items, cut)].sourceEntry.id, 'u13', 'compacted part ends where new turns start');
+  assert.equal(planMerge(projected, items, cut, 100_000), undefined, 'under budget');
+  assert.equal(planMerge(projected, items, cut, 0), undefined, 'budget off');
+  const m = planMerge(projected, items, cut, 20_000);
+  assert.ok(m, 'over budget');
+  assert.equal(projected[m.keepIndex].messages[0].role, 'user', 'kept range starts at a user message');
+  assert.ok(m.hasSummary);
+  assert.equal(m.fromN, 1);
+  assert.ok(m.compactedTokens > 20_000 && m.tokens < m.compactedTokens);
+  assert.ok(m.compactedTokens - m.tokens <= 20_000, 'what stays compacted is within the budget');
+  assert.ok(m.users.length >= 2 && m.users[0].id === 'u1');
+});
+
+test('rolling: merge summary lists the user\'s messages with recall IDs and carries an earlier index, capped', async () => {
+  const { planMerge, mergeSummary, splitMergeOps, USER_INDEX_MAX, editRequest } = await import('../extensions/lib/edit-compact.ts');
+  const projected = rolling();
+  const cut = projected.length - 2;
+  const items = buildMap(projected, 1, cut);
+  const m = planMerge(projected, items, cut, 20_000);
+  const r = editRequest('the user message', items, 0, { merge: m });
+  assert.match(r, /\{"op":"merge","text":"\.\.\."\}/);
+  assert.match(r, /together with the earlier summary/);
+  const plan = [{ op: 'merge', text: 'Goal: X. Decided Y.' }, { op: 'condense', n: m.fromN, text: 'z' }, { op: 'condense', n: m.toN + 1, text: 'kept' }];
+  const s = splitMergeOps(plan, items, m);
+  assert.equal(s.note, 'Goal: X. Decided Y.');
+  assert.deepEqual(s.ops.map(o => o.n), [m.toN + 1], 'ops inside the merged stretch are dropped');
+  assert.match(s.skipped[0], /inside the merged stretch/);
+  const noNote = splitMergeOps([{ op: 'condense', n: m.fromN, text: 'z' }], items, m);
+  assert.equal(noNote.ops.length, 1, 'without a note nothing is merged and the ops stay');
+  const carried = Array.from({ length: USER_INDEX_MAX }, (_, i) => ({ id: `old${i}`, opening: 'older' }));
+  const out = mergeSummary('Goal: X.', m, carried, 3);
+  assert.match(out.summary, /context_recall\("<id>"\)/);
+  assert.match(out.summary, /- u1: "old request 1"/);
+  assert.equal(out.users.length, USER_INDEX_MAX);
+  assert.equal(out.older, 3 + m.users.length);
+  assert.match(out.summary, new RegExp(`${3 + m.users.length} older ones are not listed`));
+});
+
+test('native: rolling merge writes a compaction entry next to the edits; the next request has note, index and newer turns', { skip: !root }, async () => {
+  const [{ createAgentSession }, { SettingsManager }, { SessionManager }, { loadExtensions }, { AssistantMessageEventStream }] = await Promise.all([
+    native('dist/core/sdk.js'), native('dist/core/settings-manager.js'), native('dist/core/session-manager.js'),
+    native('dist/core/extensions/loader.js'),
+    import(pathToFileURL(piDependency(root, '@earendil-works/pi-ai', 'dist/utils/event-stream.js')).href)]);
+  const model = { id: 'claude-opus-5-5', name: 'Opus', api: 'claude-code-stream-json', provider: 'claude-code', reasoning: true,
+    input: ['text'], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 1_000_000, maxTokens: 8000 };
+  const usage = (cacheRead = 0) => ({ input: 5, output: 5, cacheRead, cacheWrite: 10, totalTokens: 20 + cacheRead,
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } });
+  const base = { role: 'assistant', api: model.api, provider: model.provider, model: model.id, timestamp: Date.now(), usage: usage() };
+  const say = text => ({ ...base, stopReason: 'stop', content: [{ type: 'text', text }] });
+  const plan = json => ({ ...base, usage: usage(50_000), stopReason: 'stop', content: [{ type: 'text', text: '```json\n' + json + '\n```' }] });
+  const requests = [];
+  const queue = [];
+  const runtime = { getModel: () => model, getPhysicalModel: () => model, hasConfiguredAuth: () => true, isUsingOAuth: () => true,
+    getAvailableSnapshot: () => [model],
+    async streamSimple(_m, context) {
+      requests.push(structuredClone(context.messages));
+      const r = queue.shift(); assert.ok(r, 'unexpected extra model request');
+      const msg = typeof r === 'function' ? r(context) : r;
+      const s = new AssistantMessageEventStream(); s.push({ type: 'done', reason: msg.stopReason, message: msg }); s.end(); return s;
+    } };
+  const loaded = await loadExtensions([resolve('extensions/pi-warm-compact.ts')], process.cwd());
+  const resourceLoader = { getExtensions: () => loaded, getSkills: () => ({ skills: [], diagnostics: [] }), getPrompts: () => ({ prompts: [], diagnostics: [] }),
+    getThemes: () => ({ themes: [], diagnostics: [] }), getAgentsFiles: () => ({ agentsFiles: [] }), getSystemPrompt: () => undefined,
+    getSystemPromptSource: () => undefined, getAppendSystemPrompt: () => [], getAppendSystemPromptSources: () => [],
+    extendResources: () => {}, reload: async () => {} };
+  const manager = SessionManager.inMemory(process.cwd());
+  const { session } = await createAgentSession({ cwd: process.cwd(), model, thinkingLevel: 'medium', modelRuntime: runtime,
+    sessionManager: manager, resourceLoader, tools: ['context_recall'], customTools: [],
+    settingsManager: SettingsManager.inMemory({ compaction: { enabled: false }, retry: { enabled: false }, cacheWarming: 'off' }) });
+  const notes = [];
+  await session.bindExtensions?.({ uiContext: { notify: (m, t) => notes.push(`${t}:${m}`) } });
+  const run = async (cmd, reply) => {
+    queue.push(reply);
+    await session.prompt(cmd);
+    for (let i = 0; i < 50 && queue.length; i++) await new Promise(r => setTimeout(r, 10));
+    await session.waitForIdle();
+  };
+  const turn = async (i, size) => { queue.push(say(`Answer ${i}. ` + 'w'.repeat(size))); await session.prompt(`Task ${i}`); };
+  // First pass: condense every old answer the map lists.
+  for (let i = 1; i <= 8; i++) await turn(i, 40_000);
+  const condenseAll = context => {
+    const req = JSON.stringify(context.messages.at(-1));
+    const ns = [...req.matchAll(/#(\d+) assistant ~\d+ tok/g)].map(m => Number(m[1]));
+    return plan(JSON.stringify({ edits: ns.map(n => ({ op: 'condense', n, text: `condensed ${n}: ` + 'c'.repeat(6000) })) }));
+  };
+  await run('/warm-compact keep=20k budget=off', condenseAll);
+  // More work, then a second pass with a small budget: the oldest compacted stretch is merged.
+  for (let i = 9; i <= 14; i++) await turn(i, 40_000);
+  let mergeAsked = '';
+  await run('/warm-compact keep=20k budget=5k', context => {
+    mergeAsked = JSON.stringify(context.messages.at(-1));
+    return plan(JSON.stringify({ edits: [{ op: 'merge', text: 'MERGED NOTE: tasks 1-4 done, decision D kept.' }] }));
+  });
+  const status = manager.getBranch().filter(e => e.type === 'custom' && e.customType === 'pi-warm-compact-status').map(e => e.data);
+  assert.deepEqual(status.map(s => s.phase), ['start', 'done', 'start', 'done'], `${notes.join(' | ')} ${JSON.stringify(status)}`);
+  assert.match(mergeAsked, /over its budget/);
+  assert.match(status[3].text, /merged into a/);
+  const comp = manager.getBranch().filter(e => e.type === 'compaction');
+  assert.equal(comp.length, 1);
+  assert.equal(comp[0].details.mode, 'rolling');
+  queue.push(say('ok'));
+  await session.prompt('Next task');
+  const flat = JSON.stringify(requests.at(-1));
+  assert.ok(flat.includes('MERGED NOTE: tasks 1-4 done'), 'the note is in the context');
+  assert.ok(flat.includes('context_recall(\\"<id>\\")'), 'with the recall index');
+  assert.ok(!flat.includes('condensed 2: '), 'the merged stretch is gone');
+  assert.ok(flat.includes('Task 14'), 'recent turns stay');
+  // Answers 1-6 were condensed by the first pass: whether merged or kept, none comes back in full.
+  for (let i = 1; i <= 6; i++) assert.ok(!flat.includes(`Answer ${i}. www`), `answer ${i} stays compacted after the merge`);
+  assert.ok(/condensed \d+: c/.test(flat), 'first-pass edits on kept entries still apply');
+  assert.ok(!flat.includes('[pi-warm-compact request]'), 'instructions hidden');
+  // Recall still works for a merged user message.
+  const u1 = comp[0].details.users[0];
+  assert.ok(u1?.id, 'index lists the user\'s first message');
+  queue.push({ ...base, stopReason: 'toolUse', content: [{ type: 'toolCall', id: 'tc9', name: 'context_recall', arguments: { id: u1.id } }] }, say('done'));
+  await session.prompt('Recall the first task.');
+  assert.ok(JSON.stringify(requests.at(-1)).includes('Task 1'), 'context_recall returns the merged original');
 });

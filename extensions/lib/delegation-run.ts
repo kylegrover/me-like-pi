@@ -74,7 +74,7 @@ Do not return full files or diffs unless the assignment specifically requires th
 ${invokedBy === "user" ? "The user gave you this assignment directly (verbatim):" : "Assignment:"}
 ${task}`;
 
-function addUsage(total: Usage, usage: Usage) {
+export function addUsage(total: Usage, usage: Usage) {
   for (const key of ["input", "output", "cacheRead", "cacheWrite", "totalTokens"] as const) total[key] += usage[key];
   for (const key of ["input", "output", "cacheRead", "cacheWrite", "total"] as const) total.cost[key] += usage.cost[key];
   for (const key of ["reasoning", "cacheWrite1h"] as const) {
@@ -100,6 +100,18 @@ export function incompleteEvidence(files: string[], errors: string[], lastText: 
 }
 
 export const MAX_CONTINUATIONS = 5;
+
+/** Start of a final report in which the worker declines the automatic continuation. */
+export const STOPPED_MARKER = "STOPPED: less than halfway";
+/** Task of the one automatic continuation after a new worker's first budget hit. */
+export const autoCheckTask = `You ran out of budget before finishing. Before doing more work, check the workspace (e.g. git status) and judge honestly how far along the assignment is.
+- More than halfway done: continue. Finish or cleanly revert any half-done edit, complete the remaining work, and report.
+- Halfway or less: do not continue. Make the workspace consistent, then give a final report whose first line is exactly "${STOPPED_MARKER}", followed by what is done, what remains, and the checks actually run.`;
+/** Incomplete reason when the worker declines the automatic continuation. */
+export const SELF_STOP_REASON = "Worker judged the assignment halfway done or less after its first budget, and stopped.";
+/** Which budget a run ran out of, from its incomplete reason. */
+export const budgetHit = (reason?: string) => reason?.startsWith("Worker stopped after") ? "requests" as const
+  : reason?.startsWith("Worker time limit reached") ? "time" as const : undefined;
 
 /** Request controls of an OpenAI Responses payload: everything but the conversation. */
 export const payloadControls = (payload: Record<string, any>) =>
@@ -312,6 +324,10 @@ export async function runDelegate(sdk: SDK, options: {
       ? `Continuation ${continuation} of ${MAX_CONTINUATIONS} of the assignment above. Budget: ${budget.requests} model requests and ${budget.minutes} minutes.\n\n${task}`
       : workerInstructions(task, options.invokedBy, tooling.unavailable, budget), { expandPromptTemplates: false });
     if (last?.stopReason !== "stop") reason ??= last?.errorMessage ?? `Worker ended with ${last?.stopReason ?? "no final response"}.`;
+    // The worker's own judgement after the automatic self-check: less than halfway, so it stopped.
+    if (!reason && firstText(last?.content ?? []).trim().startsWith(STOPPED_MARKER)) {
+      reason = SELF_STOP_REASON;
+    }
   } catch (error) {
     reason ??= error instanceof Error ? error.message : String(error);
   } finally {
@@ -342,6 +358,33 @@ export async function runDelegate(sdk: SDK, options: {
   const text = `${reason ? `Worker incomplete: ${reason}${wrapUp === "sent" ? " (wrap-up warning was sent)" : ""}\n` : ""}${warning}${body}${cut}${hint}${historyHint}\n\nWorker session: ${file}`;
   return { content: [{ type: "text" as const, text }],
     details: { status, sessionId: manager.getSessionId(), sessionFile: file, requests: Math.min(turns, maxTurns),
-      tools: progress.tools, toolErrors, wrapUp, files, continuation, elapsedMs: Date.now() - progress.startedAt,
+      tools: progress.tools, toolErrors, wrapUp, files, continuation, budgetHit: budgetHit(reason),
+      autoContinued: false as boolean, firstBudgetHit: undefined as "requests" | "time" | undefined, elapsedMs: Date.now() - progress.startedAt,
       provider: snapshot.model.provider, model: snapshot.model.id, thinkingLevel }, usage, isError: Boolean(reason) };
+}
+
+/**
+ * runDelegate plus one automatic self-check. A new worker that runs out of budget is
+ * continued once with autoCheckTask: past halfway it finishes; otherwise it stops and says so
+ * (STOPPED_MARKER). A second budget hit reports back as usual, and continuing is left to the
+ * parent or the user. Explicit continuations never get an automatic one.
+ */
+export async function runWithSelfCheck(sdk: SDK, options: Parameters<typeof runDelegate>[1]) {
+  const first = await runDelegate(sdk, options);
+  if (options.continueFrom || !first.details.budgetHit || options.signal?.aborted || !first.details.sessionFile) return first;
+  const second = await runDelegate(sdk, { ...options, task: autoCheckTask, continueFrom: first.details.sessionFile });
+  const usage = structuredClone(first.usage);
+  addUsage(usage, second.usage);
+  const stopped = second.content[0].text.includes(SELF_STOP_REASON);
+  const outcome = stopped ? "judged itself halfway done or less, and stopped"
+    : second.details.status === "completed" ? "judged itself past halfway and finished in one automatic continuation"
+    : "continued once automatically and stopped again";
+  return { ...second, usage,
+    content: [{ type: "text" as const,
+      text: `[Worker ran out of its first budget (${first.details.budgetHit}), checked its progress, and ${outcome}.]\n${second.content[0].text}` }],
+    details: { ...second.details, autoContinued: true, firstBudgetHit: first.details.budgetHit,
+      requests: first.details.requests + second.details.requests, tools: first.details.tools + second.details.tools,
+      toolErrors: first.details.toolErrors + second.details.toolErrors,
+      files: [...new Set([...first.details.files, ...second.details.files])],
+      elapsedMs: first.details.elapsedMs + second.details.elapsedMs } };
 }

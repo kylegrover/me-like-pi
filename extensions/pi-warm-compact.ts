@@ -1,8 +1,10 @@
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { Box, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import { CUSTOM_TYPE, REQUEST_MARKER, checkpointRequest, checkpointText, planWarmCompaction, type WarmPlan } from "./lib/warm-compact.ts";
-import { applyPlan, buildMap, editRequest, parsePlan, ruleEdits, sizes, type EditDraft, type MapItem } from "./lib/edit-compact.ts";
+import { CONTEXT_OVERHEAD, CUSTOM_TYPE, REQUEST_MARKER, checkpointRequest, checkpointText, estimateProjected, parseWarmArgs,
+  planWarmCompaction, realScale, type WarmPlan } from "./lib/warm-compact.ts";
+import { applyPlan, buildMap, editRequest, mergeSummary, parsePlan, planMerge, ruleEdits, sizes, splitMergeOps,
+  type EditDraft, type MapItem, type MergePlan } from "./lib/edit-compact.ts";
 
 /**
  * Cache-warm compaction (docs/WARM_COMPACT.md).
@@ -10,11 +12,16 @@ import { applyPlan, buildMap, editRequest, parsePlan, ruleEdits, sizes, type Edi
  * Pi's /compact sends a separate summary request that can't use the prompt cache. Here the
  * compaction request is the session's own next turn, so the whole cached context is reused.
  *
- * /warm-compact [focus]       (default; `edit` also accepted) edit compaction (mode C): nothing is summarized away. Old tool
+ * /warm-compact [options] [focus]  (default; `edit` also accepted) edit compaction (mode C): old tool
  *                             output and long tool arguments shrink to placeholders by rule; the
  *                             model returns a small JSON plan to condense or fold old conversation
  *                             text. Everything is a `context_edit`, and `context_recall` restores
- *                             any original. Repeat runs leave earlier edits alone.
+ *                             any original. Repeat runs leave earlier edits alone; once the part
+ *                             they compacted is over its budget, its oldest stretch (and any earlier
+ *                             summary) is merged into one note, written as a Pi compaction entry.
+ *   options: keep=30k (real tokens kept verbatim at the end), target=40%|auto (share of the new
+ *            conversation text to keep; auto lets the model pick 25-60%), budget=40k|off (cap on
+ *            the compacted part before the oldest stretch is merged).
  * /warm-compact summary [focus]  the model writes a checkpoint summary (mode A′); old turns are
  *                             replaced by it, the last ~20k tokens stay verbatim. The fallback if
  *                             edit mode is refused.
@@ -25,7 +32,11 @@ import { applyPlan, buildMap, editRequest, parsePlan, ruleEdits, sizes, type Edi
  */
 
 type Pending = { mode: "summary" | "edit"; plan: WarmPlan; startedAt: number; cut: number; start: number;
-  rules?: Map<string, EditDraft>; items?: MapItem[]; realTokens?: number; scale: number };
+  rules?: Map<string, EditDraft>; items?: MapItem[]; realTokens?: number; scale: number; merge?: MergePlan;
+  /** Estimated tokens before the cut when the run started. */
+  olderEst: number;
+  /** The recall index of an earlier merge, carried into the next one. */
+  carried?: { id: string; opening: string }[]; carriedOlder?: number };
 
 /**
  * Real context size from the provider: the newest assistant reply's usage (input + cache read +
@@ -66,33 +77,41 @@ export default function warmCompact(pi: ExtensionAPI) {
   };
 
   pi.registerCommand("warm-compact", {
-    description: "Cache-warm compaction: `/warm-compact [focus]` (edits, recallable) or `/warm-compact summary [focus]` (checkpoint summary). Research prototype.",
+    description: "Cache-warm compaction: `/warm-compact [keep=30k] [target=40%|auto] [budget=40k|off] [focus]` (edits, recallable) or `/warm-compact summary [keep=30k] [focus]` (checkpoint summary).",
     handler: async (args: string, ctx: ExtensionCommandContext) => {
       if (pending) return ctx.ui.notify("warm-compact: already running", "warning");
       if (!ctx.isIdle()) return ctx.ui.notify("warm-compact: wait until the agent is idle", "warning");
-      const words = args.trim();
-      const mode: Pending["mode"] = /^summary\b/i.test(words) ? "summary" : "edit";
-      const focus = words.replace(/^(edit|summary)\b/i, "").trim() || undefined;
+      const opts = parseWarmArgs(args);
+      if (opts.errors.length) return ctx.ui.notify(`warm-compact: ${opts.errors.join("; ")}`, "warning");
+      const { mode, focus } = opts;
       const projected = ctx.sessionManager.buildSessionProjection().entries as any[];
-      const plan = planWarmCompaction(projected, 20_000);
+      // Character estimates split the context; the real total from the provider scales them to real tokens.
+      const realTokens = realContextTokens(projected);
+      const scale = realScale(realTokens, estimateProjected(projected));
+      const plan = planWarmCompaction(projected, opts.keep / scale);
       if (!plan) return ctx.ui.notify("warm-compact: nothing to compact (the context fits in the kept tail)", "info");
       const cut = projected.findIndex(p => p.sourceEntry.id === plan.firstKeptEntryId);
       const start = projected[0]?.sourceEntry.type === "compaction" ? 1 : 0;
-      // Character estimates split the context; the real total scales them to provider tokens.
-      const realTokens = realContextTokens(projected);
-      const estimated = plan.summarizedTokens + plan.keptTokens;
-      const scale = realTokens && estimated > 0 ? realTokens / estimated : 1;
-      pending = { mode, plan, startedAt: Date.now(), cut, start, realTokens, scale };
+      const olderEst = estimateProjected(projected, 0, cut);
+      pending = { mode, plan, startedAt: Date.now(), cut, start, realTokens, scale, olderEst };
       const before = realTokens ? ` of ${k(realTokens)} in context` : "";
       const kr = (n: number) => k(n * scale);
       let request: string;
       if (mode === "edit") {
-        const rules = ruleEdits(projected, start, cut);
         const items = buildMap(projected, start, cut);
+        const merge = planMerge(projected, items, cut, opts.budget / scale);
+        const rules = ruleEdits(projected, merge ? merge.keepIndex : start, cut);
         const s = sizes(projected, start, cut, rules);
-        pending.rules = rules; pending.items = items;
-        request = editRequest(plan.boundaryHint, items, s.before - s.after, focus);
-        pi.appendEntry<Status>(STATUS_TYPE, { phase: "start", text: `edit mode${before}: rules shrink the older ~${kr(s.before)} to ~${kr(s.after)} (${rules.size} edits); asking the model for a plan over ${items.length} messages; keeping ~${kr(plan.keptTokens)} verbatim${focus ? ` (focus: ${focus})` : ""}` });
+        const top = projected[0]?.sourceEntry;
+        if (merge && top?.type === "compaction" && top.details?.mode === "rolling") {
+          pending.carried = Array.isArray(top.details.users) ? top.details.users : [];
+          pending.carriedOlder = Number(top.details.older) || 0;
+        }
+        Object.assign(pending, { rules, items, merge });
+        request = editRequest(plan.boundaryHint, items, s.before - s.after, { focus, target: opts.target, merge, scale });
+        const target = opts.target === "auto" ? "target auto (25-60%)" : `target ${Math.round((opts.target ?? 0.4) * 100)}%`;
+        const merging = merge ? `; the compacted part is ~${kr(merge.compactedTokens)}, over its ${k(opts.budget)} budget, so its oldest ~${kr(merge.tokens)} gets merged into one note` : "";
+        pi.appendEntry<Status>(STATUS_TYPE, { phase: "start", text: `edit mode${before}: rules shrink the older ~${kr(s.before)} to ~${kr(s.after)} (${rules.size} edits); asking the model for a plan over ${items.length} messages (${target})${merging}; keeping ~${kr(plan.keptTokens)} verbatim${focus ? ` (focus: ${focus})` : ""}` });
       } else {
         request = checkpointRequest(plan, focus);
         pi.appendEntry<Status>(STATUS_TYPE, { phase: "start", text: `asking for a checkpoint${before}: ~${kr(plan.summarizedTokens)} summarized inside the cached context, ~${kr(plan.keptTokens)} kept verbatim${focus ? ` (focus: ${focus})` : ""}` });
@@ -168,22 +187,38 @@ export default function warmCompact(pi: ExtensionAPI) {
       if (m?.stopReason === "length") return fail("the plan hit the output limit");
       if ((m?.content ?? []).some((b: any) => b?.type === "toolCall")) return fail("the model called a tool instead of writing the plan");
       const reply = (m?.content ?? []).filter((b: any) => b?.type === "text").map((b: any) => b.text).join("\n");
-      const { ops, invalid, error } = parsePlan(reply);
-      if (error || !ops) return fail(`unreadable plan: ${error}`);
+      const parsed = parsePlan(reply);
+      if (parsed.error || !parsed.ops) return fail(`unreadable plan: ${parsed.error}`);
       // Re-project: entries are unchanged up to the cut (the new turn only appended after it).
       const projected = ctx.sessionManager.buildSessionProjection().entries as any[];
       const cut = projected.findIndex(e => e.sourceEntry.id === p.plan.firstKeptEntryId);
       if (cut !== p.cut) return fail("the session changed during compaction");
-      const applied = applyPlan(projected, p.start, cut, p.items!, ops, p.rules!);
-      const { edits } = applied;
-      const skipped = [...(invalid ?? []), ...applied.skipped];
-      const s = sizes(projected, p.start, cut, edits);
-      const after = p.realTokens ? Math.round((p.realTokens - (s.before - s.after) * p.scale) / 1000) : undefined;
+      const split = splitMergeOps(parsed.ops, p.items!, p.merge);
+      const merge = split.note ? p.merge : undefined;
+      const from = merge ? merge.keepIndex : p.start;
+      const applied = applyPlan(projected, p.start, cut, p.items!, split.ops, p.rules!);
+      // Edits on merged entries would have no effect once the compaction entry drops them.
+      const keepIds = new Set(projected.slice(from, cut).map(e => e.sourceEntry.id));
+      const edits = [...applied.edits.values()].filter(e => keepIds.has(e.targetId));
+      const skipped = [...(parsed.invalid ?? []), ...split.skipped, ...applied.skipped];
+      const s = sizes(projected, from, cut, applied.edits);
+      let compaction: any[] = [];
+      let olderAfter = s.after + estimateProjected(projected, 0, p.start);
+      if (merge) {
+        const m = mergeSummary(split.note!, merge, p.carried, p.carriedOlder);
+        olderAfter = s.after + Math.ceil(m.summary.length / 4);
+        compaction = [{ type: "compaction" as const, summary: m.summary, firstKeptEntryId: merge.firstKeptEntryId, usage,
+          details: { mode: "rolling", users: m.users, older: m.older, mergedTokens: Math.round(merge.tokens * p.scale), seconds: secs } }];
+      }
+      const real = (est: number) => Math.round(est * p.scale);
+      const after = p.realTokens ? CONTEXT_OVERHEAD + real(olderAfter + p.plan.keptTokens) : undefined;
+      const merged = merge ? `; oldest ~${k(real(merge.tokens))} merged into a ~${k(real(Math.ceil(split.note!.length / 4)))} note` : "";
       finish(ctx, `done in ${secs}s: ${numbers}`);
       return {
-        entries: [...event.entries, ...hide, ...edits.values(),
+        entries: [...event.entries, ...hide, ...edits,
           { type: "custom" as const, customType: STATUS_TYPE, data: { phase: "done",
-            text: `edit mode done in ${secs}s. Older context ~${k(s.before * p.scale)} → ~${k(s.after * p.scale)}${after !== undefined ? ` (whole context ~${k(p.realTokens!)} → ~${after}k)` : ""}; ${edits.size} edits, ${ops.length} model ops${skipped.length ? `, ${skipped.length} skipped` : ""}; last ~${k(p.plan.keptTokens * p.scale)} verbatim. ${cache}: ${numbers}${skipped.length ? `\nSkipped: ${skipped.join("; ")}` : ""}` } satisfies Status }],
+            text: `edit mode done in ${secs}s. Older context ~${k(real(p.olderEst))} → ~${k(real(olderAfter))}${after !== undefined ? ` (whole context ~${k(p.realTokens!)} → ~${k(after)})` : ""}; ${edits.length} edits, ${parsed.ops.length} model ops${skipped.length ? `, ${skipped.length} skipped` : ""}${merged}; last ~${k(real(p.plan.keptTokens))} verbatim. ${cache}: ${numbers}${skipped.length ? `\nSkipped: ${skipped.join("; ")}` : ""}` } satisfies Status },
+          ...compaction],
         continue: false,
       };
     }

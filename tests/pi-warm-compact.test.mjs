@@ -101,7 +101,7 @@ test('native: the checkpoint request extends the cached prefix; afterwards the c
   await session.prompt('Task one.');
   await session.prompt('Task two.');
   await session.prompt('Task three.');
-  await session.prompt('/warm-compact summary');
+  await session.prompt('/warm-compact summary keep=20k');
   // pi.sendMessage starts the turn without awaiting it.
   for (let i = 0; i < 50 && requests.length < 4; i++) await new Promise(r => setTimeout(r, 10));
   await session.waitForIdle();
@@ -178,7 +178,7 @@ test('native: a tool call instead of a checkpoint is blocked and leaves the cont
   await session.bindExtensions?.({ uiContext: { notify: (m, t) => notes.push(`${t}:${m}`) } });
   await session.prompt('One.');
   await session.prompt('Two.');
-  await session.prompt('/warm-compact summary');
+  await session.prompt('/warm-compact summary keep=20k');
   for (let i = 0; i < 50 && requests.length < 3; i++) await new Promise(r => setTimeout(r, 10));
   await session.waitForIdle();
   assert.equal(executed, 0, 'the tool never ran');
